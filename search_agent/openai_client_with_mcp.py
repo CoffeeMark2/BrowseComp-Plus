@@ -7,6 +7,7 @@ import csv
 from tqdm import tqdm
 from prompts import format_query
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import traceback
 
 from rich import print as rprint
 from dotenv import load_dotenv
@@ -201,6 +202,7 @@ def _process_tsv_dataset(tsv_path: str, client: "openai.OpenAI", args):
             response = client.responses.create(**request_body)
             _persist_response(out_dir, request_body, response, query_id=qid)
         except Exception as exc:
+            traceback.print_exc()
             print(f"[Error] Query id={qid} failed: {exc}")
 
     if args.num_threads <= 1:

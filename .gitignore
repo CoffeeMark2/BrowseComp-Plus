@@ -1,4 +1,10 @@
 .env
+*.err
+*.log
+*.json
+*.sh
+*.jsonl
+
 __pycache__/
 .venv
 .vscode

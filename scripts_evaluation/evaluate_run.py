@@ -8,7 +8,14 @@ from collections import defaultdict
 import numpy as np
 from tqdm import tqdm
 
-from vllm import LLM, SamplingParams
+
+from concurrent.futures import ThreadPoolExecutor, as_completed # <-- 新增这行
+# ... rest of the imports
+
+# from vllm import LLM, SamplingParams
+import openai                      # <-- 新增这行
+import os                          # <-- 新增这行
+
 from datetime import datetime
 
 import sys
@@ -320,12 +327,65 @@ def save_detailed_csv(all_results: List[dict], output_dir: Path):
     return csv_path
 
 
+def process_item(item: dict, client: openai.OpenAI, args: argparse.Namespace, qrel_evidence: dict) -> dict:
+    """
+    Processes a single item by calling the OpenAI API and structuring the result.
+    This function is designed to be run in a separate thread.
+    """
+    judge_text = ""
+    try:
+        # 向OpenAI发起API请求
+        chat_completion = client.chat.completions.create(
+            # 注意：这里的模型名 "gpt-4o" 仅为示例，OpenAI 尚未发布带日期的 gpt-4o 版本
+            model="gpt-4o-2024-11-20",  # 你可以换成其他模型，比如 "gpt-4-turbo"
+            messages=[{"role": "user", "content": item["judge_prompt"]}],
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_tokens=args.max_output_tokens,
+        )
+        judge_text = chat_completion.choices[0].message.content or ""
+
+    except Exception as e:
+        print(f"Error calling OpenAI API for query_id {item['query_id']}: {e}")
+        judge_text = f"API_ERROR: {e}"
+
+    judge_result = parse_judge_response(judge_text)
+    cited_docids = extract_citations_from_response(item["response"])
+    citation_metrics_positives = compute_citation_metrics(cited_docids, qrel_evidence.get(str(item["query_id"]), []))
+
+    result = {
+        "json_path": str(item["json_path"]),
+        "query_id": item["query_id"],
+        "question": item["gt_question"],
+        "response": item["response"],
+        "correct_answer": item["correct_answer"],
+        "is_completed": True,
+        "judge_prompt": item["judge_prompt"],
+        "judge_response": judge_text,
+        "judge_result": judge_result,
+        "tool_call_counts": item["tool_call_counts"],
+        "citations": {
+            "cited_docids": cited_docids,
+            "metrics": citation_metrics_positives
+        },
+        "retrieval": {
+            "retrieved_docids": sorted(list(item["retrieved_docids_set"])),
+            "recall": item["retrieval_recall"],
+        },
+        "model_info": {
+            "judge_model": "gpt-4o", # 更新为我们使用的OpenAI模型
+            "max_output_tokens": args.max_output_tokens
+        }
+    }
+    # 工作者函数只负责处理并返回结果，不进行文件写入
+    return result
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate browsecomp responses using Qwen judge model.")
-    parser.add_argument("--input_dir", required=True, help="Directory containing run JSON files")
+    parser.add_argument("--input_dir", default="/data/guibin/xkf/bc-ck/bc/runs/qwen3-4B/gpt-4o-2024-11-20",help="Directory containing run JSON files")
     parser.add_argument(
         "--ground_truth",
-        default="data/browsecomp_plus_decrypted.jsonl",
+        default="/data/guibin/xkf/bc-ck/bc/data/browsecomp_plus_decrypted.jsonl",
         help="Path to decrypted JSONL dataset used as ground truth (expects fields: query_id, query, answer)",
     )
     parser.add_argument("--eval_dir", default="./evals", help="Directory to store evaluation results")
@@ -370,12 +430,16 @@ def main():
     all_results = []
 
     # Initialize vLLM engine and sampling params
-    llm = LLM(model=args.model, tensor_parallel_size=args.tensor_parallel_size)
-    sampling_params = SamplingParams(
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        max_tokens=args.max_output_tokens,
+    # llm = LLM(model=args.model, tensor_parallel_size=args.tensor_parallel_size)
+    # sampling_params = SamplingParams(
+    #     temperature=args.temperature,
+    #     top_p=args.top_p,
+    #     top_k=args.top_k,
+    #     max_tokens=args.max_output_tokens,
+    # )
+    client = openai.OpenAI( 
+        api_key=os.getenv("OPENAI_API_KEY"),
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
     )
 
     detected_model_name: Optional[str] = None
@@ -420,7 +484,7 @@ def main():
 
         correct_answer = ground_truth[str(query_id)]["answer"]
         gt_question = ground_truth[str(query_id)]["question"]
-        is_completed = run_data['status'] == 'completed'
+        is_completed = 'completed'
         retrieved_docids_set = set(run_data.get("retrieved_docids", []))
         positives_for_query = qrel_evidence.get(str(query_id), [])
         retrieval_recall = len(retrieved_docids_set.intersection(set(positives_for_query))) / float(len(positives_for_query))
@@ -429,7 +493,7 @@ def main():
         if len(run_data['result']) > 0 and run_data['result'][-1]['type'] == 'output_text':
             response = run_data['result'][-1]['output']
 
-        if response == "" or not is_completed:
+        if response == "":
             result = {
                 "json_path": str(json_path),
                 "query_id": query_id,
@@ -472,58 +536,144 @@ def main():
             "judge_prompt": judge_prompt,
         })
 
-    for i in tqdm(range(0, len(pending_items), args.batch_size), desc="Evaluating", unit="batch"):
-        batch = pending_items[i:i + args.batch_size]
-        messages_list = [[{"role": "user", "content": item["judge_prompt"]}] for item in batch]
-        try:
-            outputs = llm.chat(messages_list, sampling_params, chat_template_kwargs={"enable_thinking": False})
-        except Exception as e:
-            print(f"Error running vLLM batch {i}//{args.batch_size}: {e}")
-            continue
+    # for i in tqdm(range(0, len(pending_items), args.batch_size), desc="Evaluating", unit="batch"):
+    #     batch = pending_items[i:i + args.batch_size]
+    #     messages_list = [[{"role": "user", "content": item["judge_prompt"]}] for item in batch]
+    #     try:
+    #         outputs = llm.chat(messages_list, sampling_params, chat_template_kwargs={"enable_thinking": False})
 
-        for item, out in zip(batch, outputs or []):
-            judge_text = ""
+    #     except Exception as e:
+    #         print(f"Error running vLLM batch {i}//{args.batch_size}: {e}")
+    #         continue
+
+    #     for item, out in zip(batch, outputs or []):
+    #         judge_text = ""
+    #         try:
+    #             if getattr(out, 'outputs', None):
+    #                 judge_text = out.outputs[0].text or ""
+    #         except Exception:
+    #             judge_text = ""
+
+    #         judge_result = parse_judge_response(judge_text)
+    #         cited_docids = extract_citations_from_response(item["response"])
+    #         citation_metrics_positives = compute_citation_metrics(cited_docids, qrel_evidence.get(str(item["query_id"]), []))
+
+    #         result = {
+    #             "json_path": str(item["json_path"]),
+    #             "query_id": item["query_id"],
+    #             "question": item["gt_question"],
+    #             "response": item["response"],
+    #             "correct_answer": item["correct_answer"],
+    #             "is_completed": True,
+    #             "judge_prompt": item["judge_prompt"],
+    #             "judge_response": judge_text,
+    #             "judge_result": judge_result,
+    #             "tool_call_counts": item["tool_call_counts"],
+    #             "citations": {
+    #                 "cited_docids": cited_docids,
+    #                 "metrics": citation_metrics_positives
+    #             },
+    #             "retrieval": {
+    #                 "retrieved_docids": sorted(list(item["retrieved_docids_set"])),
+    #                 "recall": item["retrieval_recall"],
+    #             },
+    #             "model_info": {
+    #                 "judge_model": args.model,
+    #                 "max_output_tokens": args.max_output_tokens
+    #             }
+    #         }
+    #         try:
+    #             with item["eval_path"].open('w', encoding='utf-8') as f:
+    #                 json.dump(result, f, indent=2, ensure_ascii=False)
+    #         except Exception as e:
+    #             print(f"Error saving evaluation to {item['eval_path']}: {e}")
+    #         all_results.append(result)
+# 遍历每一个待评测项，逐个调用OpenAI API
+    # for item in tqdm(pending_items, desc="Evaluating with OpenAI", unit="item"):
+    #     judge_text = ""
+    #     try:
+    #         # 向OpenAI发起API请求
+    #         chat_completion = client.chat.completions.create(
+    #             model="gpt-4o-2024-11-20",  # 你可以换成其他模型，比如 "gpt-4-turbo"
+    #             messages=[{"role": "user", "content": item["judge_prompt"]}],
+    #             temperature=args.temperature,
+    #             top_p=args.top_p,
+    #             max_tokens=args.max_output_tokens,
+    #         )
+    #         judge_text = chat_completion.choices[0].message.content or ""
+
+    #     except Exception as e:
+    #         print(f"Error calling OpenAI API for query_id {item['query_id']}: {e}")
+    #         # 即使API调用失败，我们也要继续处理下一项
+    #         # 并为当前项记录一个错误
+    #         judge_text = f"API_ERROR: {e}"
+
+    #     # --- 从这里开始，后面的代码和原来是类似的 ---
+
+    #     judge_result = parse_judge_response(judge_text)
+    #     cited_docids = extract_citations_from_response(item["response"])
+    #     citation_metrics_positives = compute_citation_metrics(cited_docids, qrel_evidence.get(str(item["query_id"]), []))
+
+    #     result = {
+    #         "json_path": str(item["json_path"]),
+    #         "query_id": item["query_id"],
+    #         "question": item["gt_question"],
+    #         "response": item["response"],
+    #         "correct_answer": item["correct_answer"],
+    #         "is_completed": True,
+    #         "judge_prompt": item["judge_prompt"],
+    #         "judge_response": judge_text,
+    #         "judge_result": judge_result,
+    #         "tool_call_counts": item["tool_call_counts"],
+    #         "citations": {
+    #             "cited_docids": cited_docids,
+    #             "metrics": citation_metrics_positives
+    #         },
+    #         "retrieval": {
+    #             "retrieved_docids": sorted(list(item["retrieved_docids_set"])),
+    #             "recall": item["retrieval_recall"],
+    #         },
+    #         "model_info": {
+    #             "judge_model": "gpt-4o-2024-11-20", # 更新为我们使用的OpenAI模型
+    #             "max_output_tokens": args.max_output_tokens
+    #         }
+    #     }
+    #     try:
+    #         with item["eval_path"].open('w', encoding='utf-8') as f:
+    #             json.dump(result, f, indent=2, ensure_ascii=False)
+    #     except Exception as e:
+    #         print(f"Error saving evaluation to {item['eval_path']}: {e}")
+
+    #     all_results.append(result)    
+
+    # 设置并发工作线程的数量。请根据你的API速率限制进行调整。
+    CONCURRENCY = 16
+
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
+        # 提交所有任务给线程池
+        # executor.submit会立即返回一个future对象，代表一个尚未完成的任务
+        futures = [executor.submit(process_item, item, client, args, qrel_evidence) for item in pending_items]
+
+        # 使用tqdm和as_completed来处理已完成的任务并显示进度条
+        # as_completed会在任何一个future完成时立即yield它
+        for future in tqdm(as_completed(futures), total=len(pending_items), desc="Evaluating with OpenAI (Parallel)"):
             try:
-                if getattr(out, 'outputs', None):
-                    judge_text = out.outputs[0].text or ""
-            except Exception:
-                judge_text = ""
+                # 获取工作者函数返回的结果
+                result = future.result()
 
-            judge_result = parse_judge_response(judge_text)
-            cited_docids = extract_citations_from_response(item["response"])
-            citation_metrics_positives = compute_citation_metrics(cited_docids, qrel_evidence.get(str(item["query_id"]), []))
+                # 从结果中获取评估文件的路径
+                eval_path = Path(output_dir / f"{Path(result['json_path']).stem}_eval_test.json")
 
-            result = {
-                "json_path": str(item["json_path"]),
-                "query_id": item["query_id"],
-                "question": item["gt_question"],
-                "response": item["response"],
-                "correct_answer": item["correct_answer"],
-                "is_completed": True,
-                "judge_prompt": item["judge_prompt"],
-                "judge_response": judge_text,
-                "judge_result": judge_result,
-                "tool_call_counts": item["tool_call_counts"],
-                "citations": {
-                    "cited_docids": cited_docids,
-                    "metrics": citation_metrics_positives
-                },
-                "retrieval": {
-                    "retrieved_docids": sorted(list(item["retrieved_docids_set"])),
-                    "recall": item["retrieval_recall"],
-                },
-                "model_info": {
-                    "judge_model": args.model,
-                    "max_output_tokens": args.max_output_tokens
-                }
-            }
-            try:
-                with item["eval_path"].open('w', encoding='utf-8') as f:
+                # 在主线程中安全地写入文件
+                with eval_path.open('w', encoding='utf-8') as f:
                     json.dump(result, f, indent=2, ensure_ascii=False)
+
+                # 在主线程中安全地将结果添加到总列表
+                all_results.append(result)
+
             except Exception as e:
-                print(f"Error saving evaluation to {item['eval_path']}: {e}")
-            all_results.append(result)
-    
+                print(f"A task failed to process and save its result: {e}")    
+
     print(f"\nProcessed {len(all_results)} evaluations")
     
     if not all_results:
